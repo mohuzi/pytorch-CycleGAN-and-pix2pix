@@ -55,6 +55,15 @@ class BaseOptions():
         parser.add_argument('--verbose', action='store_true', help='if specified, print more debugging information')
         parser.add_argument('--suffix', default='', type=str, help='customized suffix: opt.name = opt.name + suffix: e.g., {model}_{netG}_size{load_size}')
         self.initialized = True
+
+        parser.add_argument('--nlatent', type=int, default=16, help='# of latent code dimensions. Used only for stochastic models, e.g. cycle_ali')
+        parser.add_argument('--use_sigmoid', type=bool, default=False, help='Use sigmoid in aug cycleGAN.')
+        parser.add_argument('--enc_A_B', type=int, default=1, choices=[0,1], help='encoder of z_B conditoned on both A and B')
+        parser.add_argument('--z_gan', type=int, default=1, choices=[0,1], help='use a GAN on z_B')
+        parser.add_argument('--stoch_enc', action='store_true', help='use a stochastic encoder')
+        parser.add_argument('--lambda_z_B', type=float, default=0.025, help='weight for cycle loss (B -> A -> B)')
+        parser.add_argument('--nef', type=int, default=32, help='# of encoder filters in first conv layer')
+
         return parser
 
     def gather_options(self):

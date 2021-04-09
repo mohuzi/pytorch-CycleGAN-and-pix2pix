@@ -158,6 +158,23 @@ def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, in
         raise NotImplementedError('Generator model name [%s] is not recognized' % netG)
     return init_net(net, init_type, init_gain, gpu_ids)
 
+def define_stochastic_G(nlatent, input_nc, output_nc, ngf, norm='instance', use_dropout=False,init_type='normal', init_gain=0.02,gpu_ids=[]):
+
+    netG = None
+    use_gpu = len(gpu_ids) > 0
+
+    if use_gpu:
+        assert(torch.cuda.is_available())
+
+    norm_layer = CondInstanceNorm
+
+    netG = CINResnetGenerator(nlatent, input_nc, output_nc, ngf, norm_layer=norm_layer,
+                              use_dropout=use_dropout, n_blocks=9, gpu_ids=gpu_ids)
+
+    if len(gpu_ids) > 0:
+        netG.cuda() 
+    return init_net(netG, init_type, init_gain, gpu_ids)
+
 
 def define_D(input_nc, ndf, netD, n_layers_D=3, norm='batch', init_type='normal', init_gain=0.02, gpu_ids=[]):
     """Create a discriminator
@@ -613,3 +630,312 @@ class PixelDiscriminator(nn.Module):
     def forward(self, input):
         """Standard forward."""
         return self.net(input)
+
+###############################################################################
+# Conditional Blocks for Augmented CycleGAN
+###############################################################################
+
+######################################################################
+# Superclass of all Modules that take two inputs
+######################################################################
+class TwoInputModule(nn.Module):
+    def forward(self, input1, input2):
+        raise NotImplementedError
+
+######################################################################
+# A module implementing conditional instance norm.
+# Takes two inputs: x (input features) and z (latent codes)
+######################################################################
+class CondInstanceNorm(TwoInputModule):
+    def __init__(self, x_dim, z_dim, eps=1e-5):
+        """`x_dim` dimensionality of x input
+           `z_dim` dimensionality of z latents
+        """
+        super(CondInstanceNorm, self).__init__()
+        self.eps = eps
+        self.shift_conv = nn.Sequential(
+            nn.Conv2d(z_dim, x_dim, kernel_size=1, padding=0, bias=True),
+            nn.ReLU(True)
+        )
+        self.scale_conv = nn.Sequential(
+            nn.Conv2d(z_dim, x_dim, kernel_size=1, padding=0, bias=True),
+            nn.ReLU(True)
+        )
+
+    def forward(self, input, noise):
+        # assumes input.dim() == 4, TODO: generalize that.
+
+        shift = self.shift_conv.forward(noise)
+        scale = self.scale_conv.forward(noise)
+        size = input.size()
+        x_reshaped = input.view(size[0], size[1], size[2]*size[3])
+        mean = x_reshaped.mean(2, keepdim=True)
+        var = x_reshaped.var(2, keepdim=True)
+        std =  torch.rsqrt(var + self.eps)
+        norm_features = ((x_reshaped - mean) * std).view(*size)
+        output = norm_features * scale + shift
+        return output
+
+######################################################################
+# A (sort of) hacky way to create a container that takes two inputs (e.g. x and z)
+# and applies a sequence of modules (exactly like nn.Sequential) but MergeModule
+# is one of its submodules it applies it to both inputs
+######################################################################
+class TwoInputSequential(nn.Sequential, TwoInputModule):
+    def __init__(self, *args):
+        super(TwoInputSequential, self).__init__(*args)
+
+    def forward(self, input1, input2):
+        """overloads forward function in parent calss"""
+
+        for module in list(self._modules.values()):
+            if isinstance(module, TwoInputModule):
+                input1 = module.forward(input1, input2)
+            else:
+                input1 = module.forward(input1)
+        return input1
+
+
+######################################################################
+# A modified resnet block which allows for passing additional noise input
+# to be used for conditional instance norm
+######################################################################
+class CINResnetBlock(TwoInputModule):
+    def __init__(self, x_dim, z_dim, padding_type, norm_layer, use_dropout, use_bias):
+        super(CINResnetBlock, self).__init__()
+        self.conv_block = self.build_conv_block(x_dim, z_dim, padding_type, norm_layer, use_dropout, use_bias)
+        self.relu = nn.ReLU(True)
+
+        for idx, module in enumerate(self.conv_block):
+            self.add_module(str(idx), module)
+
+    def build_conv_block(self, x_dim, z_dim, padding_type, norm_layer, use_dropout, use_bias):
+        conv_block = []
+        p = 0
+        if padding_type == 'reflect':
+            conv_block += [nn.ReflectionPad2d(1)]
+        elif padding_type == 'replicate':
+            conv_block += [nn.ReplicationPad2d(1)]
+        elif padding_type == 'zero':
+            p = 1
+        else:
+            raise NotImplementedError('padding [%s] is not implemented' % padding_type)
+
+        conv_block += [
+            MergeModule(
+                nn.Conv2d(x_dim, x_dim, kernel_size=3, padding=p, bias=use_bias),
+                norm_layer(x_dim, z_dim)
+            ),
+            nn.ReLU(True)
+        ]
+        if use_dropout:
+            conv_block += [nn.Dropout(0.5)]
+
+        p = 0
+        if padding_type == 'reflect':
+            conv_block += [nn.ReflectionPad2d(1)]
+        elif padding_type == 'replicate':
+            conv_block += [nn.ReplicationPad2d(1)]
+        elif padding_type == 'zero':
+            p = 1
+        else:
+            raise NotImplementedError('padding [%s] is not implemented' % padding_type)
+
+        conv_block += [nn.Conv2d(x_dim, x_dim, kernel_size=3, padding=p, bias=use_bias),
+                       nn.InstanceNorm2d(x_dim, affine=True)]
+
+        return TwoInputSequential(*conv_block)
+
+    def forward(self, x, noise):
+        out = self.conv_block(x, noise)
+        out = self.relu(x + out)
+        return out
+
+######################################################################
+# A (sort of) hacky way to create a module that takes two inputs (e.g. x and z)
+# and returns one output (say o) defined as follows:
+# o = module2.forward(module1.forward(x), z)
+# Note that module2 MUST support two inputs as well.
+######################################################################
+class MergeModule(TwoInputModule):
+    def __init__(self, module1, module2):
+        """ module1 could be any module (e.g. Sequential of several modules)
+            module2 must accept two inputs
+        """
+        super(MergeModule, self).__init__()
+        self.module1 = module1
+        self.module2 = module2
+
+    def forward(self, input1, input2):
+        output1 = self.module1.forward(input1)
+        output2 = self.module2.forward(output1, input2)
+        return output2
+
+######################################################################
+# Modified version of ResnetGenerator that supports stochastic mappings
+# using Conditonal instance norm (can support CBN easily)
+######################################################################
+class CINResnetGenerator(nn.Module):
+    def __init__(self, nlatent, input_nc, output_nc, ngf=64, norm_layer=CondInstanceNorm,
+                 use_dropout=False, n_blocks=9, gpu_ids=[], padding_type='reflect'):
+        assert(n_blocks >= 0)
+        super(CINResnetGenerator, self).__init__()
+        self.gpu_ids = gpu_ids
+
+        instance_norm = functools.partial(nn.InstanceNorm2d, affine=True)
+
+        model = [
+            nn.ReflectionPad2d(3),
+            nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0, stride=1, bias=True),
+            norm_layer(ngf, nlatent),
+            nn.ReLU(True),
+
+            nn.Conv2d(ngf, 2*ngf, kernel_size=3, padding=1, stride=1, bias=True),
+            norm_layer(2*ngf, nlatent),
+            nn.ReLU(True),
+
+            nn.Conv2d(2*ngf, 4*ngf, kernel_size=3, padding=1, stride=2, bias=True),
+            norm_layer(4*ngf, nlatent),
+            nn.ReLU(True)
+        ]
+        
+        for i in range(3):
+            model += [CINResnetBlock(x_dim=4*ngf, z_dim=nlatent, padding_type=padding_type,
+                                     norm_layer=norm_layer, use_dropout=use_dropout, use_bias=True)]
+
+        model += [
+            nn.ConvTranspose2d(4*ngf, 2*ngf, kernel_size=3, stride=2, padding=1,
+                               output_padding=1, bias=True),
+            norm_layer(2*ngf , nlatent),
+            nn.ReLU(True),
+
+            nn.Conv2d(2*ngf, ngf, kernel_size=3, padding=1, stride=1, bias=True),
+            norm_layer(ngf, nlatent),
+            nn.ReLU(True),
+
+            nn.Conv2d(ngf, output_nc, kernel_size=7, padding=3),
+            nn.Tanh()
+        ]
+
+        self.model = TwoInputSequential(*model)
+
+    def forward(self, input, noise):
+        if len(self.gpu_ids)>1 and isinstance(input.data, torch.cuda.FloatTensor):
+            return nn.parallel.data_parallel(self.model, (input, noise), self.gpu_ids)
+        else:
+            return self.model(input, noise)
+
+######################################################################
+# Encoder network for latent variables
+######################################################################
+class LatentEncoder(nn.Module):
+    def __init__(self, nlatent, input_nc, nef, norm_layer, gpu_ids=[]):
+        super(LatentEncoder, self).__init__()
+        self.gpu_ids = gpu_ids
+        use_bias = False
+
+        kw = 3
+        sequence = [
+            nn.Conv2d(input_nc, nef, kernel_size=kw, stride=2, padding=1, bias=True),
+            nn.ReLU(True),
+
+            nn.Conv2d(nef, 2*nef, kernel_size=kw, stride=2, padding=1, bias=use_bias),
+            norm_layer(2*nef),
+            nn.ReLU(True),
+
+            nn.Conv2d(2*nef, 4*nef, kernel_size=kw, stride=2, padding=1, bias=use_bias),
+            norm_layer(4*nef),
+            nn.ReLU(True),
+
+            nn.Conv2d(4*nef, 8*nef, kernel_size=kw, stride=2, padding=1, bias=use_bias),
+            norm_layer(8*nef),
+            nn.ReLU(True),
+
+            nn.Conv2d(8*nef, 8*nef, kernel_size=4, stride=1, padding=0, bias=use_bias),
+            norm_layer(8*nef),
+            nn.ReLU(True),
+
+        ]
+
+        self.conv_modules = nn.Sequential(*sequence)
+
+        # make sure we return mu and logvar for latent code normal distribution
+        self.enc_mu = nn.Conv2d(8*nef, nlatent, kernel_size=10, stride=1, padding=0, bias=True)
+        self.enc_logvar = nn.Conv2d(8*nef, nlatent, kernel_size=10, stride=1, padding=0, bias=True)
+
+    def forward(self, input):
+        if len(self.gpu_ids)>1 and isinstance(input.data, torch.cuda.FloatTensor):
+            conv_out = nn.parallel.data_parallel(self.conv_modules, input, self.gpu_ids)
+            mu = nn.parallel.data_parallel(self.enc_mu, conv_out, self.gpu_ids)
+            logvar = nn.parallel.data_parallel(self.enc_logvar, conv_out, self.gpu_ids)
+        else:
+            conv_out = self.conv_modules(input)
+            mu = self.enc_mu(conv_out)
+            logvar = self.enc_logvar(conv_out)
+        return (mu.view(mu.size(0), -1), logvar.view(logvar.size(0), -1))
+
+class DiscriminatorLatent(nn.Module):
+    def __init__(self, nlatent, ndf,
+                 use_sigmoid=False, gpu_ids=[]):
+        super(DiscriminatorLatent, self).__init__()
+
+        self.gpu_ids = gpu_ids
+        self.nlatent = nlatent
+
+        use_bias = True
+        sequence = [
+            nn.Linear(nlatent, ndf),
+            nn.BatchNorm1d(ndf),
+            nn.LeakyReLU(0.2, True),
+
+            nn.Linear(ndf, ndf),
+            nn.BatchNorm1d(ndf),
+            nn.LeakyReLU(0.2, True),
+
+            nn.Linear(ndf, ndf),
+            nn.BatchNorm1d(ndf),
+            nn.LeakyReLU(0.2, True),
+
+            nn.Linear(ndf, 1)
+        ]
+
+        if use_sigmoid:
+            sequence += [nn.Sigmoid()]
+
+        self.model = nn.Sequential(*sequence)
+
+    def forward(self, input):
+        if input.dim() == 4:
+            input = input.view(input.size(0), self.nlatent)
+
+        if len(self.gpu_ids)>1 and isinstance(input.data, torch.cuda.FloatTensor):
+            return nn.parallel.data_parallel(self.model, input, self.gpu_ids)
+        else:
+            return self.model(input)
+
+def define_LAT_D(nlatent, ndf, use_sigmoid=False,init_type='normal', init_gain=0.02, gpu_ids=[]):
+    netD = None
+    use_gpu = len(gpu_ids) > 0
+
+    if use_gpu:
+        assert(torch.cuda.is_available())
+
+    netD = DiscriminatorLatent(nlatent, ndf, use_sigmoid=use_sigmoid, gpu_ids=gpu_ids)
+
+    if use_gpu:
+        netD.cuda() 
+     
+    return init_net(netD,init_type, init_gain, gpu_ids)
+
+def define_E(nlatent, input_nc, nef, norm='batch',init_type='normal', init_gain=0.02, gpu_ids=[]):
+    use_gpu = len(gpu_ids) > 0
+    norm_layer = get_norm_layer(norm_type=norm)
+
+    if use_gpu:
+        assert(torch.cuda.is_available())
+    netE = LatentEncoder(nlatent, input_nc, nef, norm_layer=norm_layer, gpu_ids=gpu_ids)
+
+    if use_gpu:
+        netE.cuda() 
+
+    return init_net(netE,init_type, init_gain, gpu_ids)
