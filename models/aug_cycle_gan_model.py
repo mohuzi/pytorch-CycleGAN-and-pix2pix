@@ -69,7 +69,7 @@ class AugCycleGANModel(BaseModel):
         # specify the models you want to save to the disk. The training/test scripts will call <BaseModel.save_networks> and <BaseModel.load_networks>.
         # TODO
         if self.isTrain:
-            self.model_names = ['G_A_B', 'G_B_A', 'D_A', 'D_B']
+            self.model_names = ['G_A_B', 'G_B_A', 'D_A', 'D_B',"D_z_B","E_B"]
         else:  # during test time, only load Gs
             self.model_names = ['G_A_B', 'G_B_A']
 
