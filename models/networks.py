@@ -799,7 +799,7 @@ class CINResnetGenerator(nn.Module):
             nn.ReLU(True)
         ]
         
-        for i in range(3):
+        for i in range(n_blocks):
             model += [CINResnetBlock(x_dim=4*ngf, z_dim=nlatent, padding_type=padding_type,
                                      norm_layer=norm_layer, use_dropout=use_dropout, use_bias=True)]
 

@@ -82,23 +82,25 @@ class AugCycleGANModel(BaseModel):
                                           not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids)
 
         enc_input_nc = opt.output_nc
+        if opt.enc_A_B:
+            enc_input_nc += opt.input_nc
 
         if self.isTrain:  # define discriminators
             self.netD_A = networks.define_D(opt.output_nc, opt.ndf, opt.netD,
                                             opt.n_layers_D, opt.norm, opt.init_type, opt.init_gain, self.gpu_ids)
             self.netD_B = networks.define_D(opt.input_nc, opt.ndf, opt.netD,
                                             opt.n_layers_D, opt.norm, opt.init_type, opt.init_gain, self.gpu_ids)
-
-            self.netE_B = networks.define_E(nlatent=opt.nlatent, input_nc=enc_input_nc,
-                                            nef=opt.nef, norm='batch',
-                                            init_type=opt.init_type,
-                                            init_gain=opt.init_gain,
-                                            gpu_ids=opt.gpu_ids)
             self.netD_z_B = networks.define_LAT_D(nlatent=opt.nlatent, ndf=opt.ndf,
                                                   use_sigmoid=opt.use_sigmoid,
                                                   init_type=opt.init_type,
                                                   init_gain=opt.init_gain,
                                                   gpu_ids=opt.gpu_ids)
+        
+        self.netE_B = networks.define_E(nlatent=opt.nlatent, input_nc=enc_input_nc,
+                                nef=opt.nef, norm='batch',
+                                init_type=opt.init_type,
+                                init_gain=opt.init_gain,
+                                gpu_ids=opt.gpu_ids)
 
         if self.isTrain:
             if opt.lambda_identity > 0.0:  # only works when input and output images have the same number of channels
@@ -162,26 +164,25 @@ class AugCycleGANModel(BaseModel):
         self.fake_B = self.netG_A_B.forward(self.real_A, prior_z_B)
         ##### generate A and z_B from B : A <-- B --> z_B
         self.fake_A = self.netG_B_A.forward(self.real_B) 
+ 
+        if self.opt.enc_A_B:
+            concat_B_A = torch.cat((self.fake_A, self.real_B), 1)
+            self.mu_z_realB, self.logvar_z_realB = self.netE_B.forward(concat_B_A)
+        else:
+            self.mu_z_realB, self.logvar_z_realB = self.netE_B.forward(self.real_B)
 
-        if self.isTrain:
-            if self.opt.enc_A_B:
-                concat_B_A = torch.cat((self.fake_A, self.real_B), 1)
-                self.mu_z_realB, self.logvar_z_realB = self.netE_B.forward(concat_B_A)
-            else:
-                self.mu_z_realB, self.logvar_z_realB = self.netE_B.forward(self.real_B)
-
-            if self.opt.stoch_enc:
-                self.post_z_realB = gauss_reparametrize(self.mu_z_realB, self.logvar_z_realB)
-            else:
-                self.post_z_realB = self.mu_z_realB.view(self.mu_z_realB.size(0), self.mu_z_realB.size(1), 1, 1)
-                self.logvar_z_realB = self.logvar_z_realB * 0.0
+        if self.opt.stoch_enc:
+            self.post_z_realB = gauss_reparametrize(self.mu_z_realB, self.logvar_z_realB)
+        else:
+            self.post_z_realB = self.mu_z_realB.view(self.mu_z_realB.size(0), self.mu_z_realB.size(1), 1, 1)
+            self.logvar_z_realB = self.logvar_z_realB * 0.0
 
 
         ##### A -> B -> A cycle loss
         self.rec_A = self.netG_B_A(self.fake_B)    
 
         ##### B -> A -> B cycle loss
-        self.rec_B = self.netG_A_B(self.fake_A,prior_z_B)   
+        self.rec_B = self.netG_A_B(self.fake_A,self.post_z_realB)   
 
         # reconstruct z_B from A and fake_B : A ==> z_B <== fake_B
         if self.isTrain:
