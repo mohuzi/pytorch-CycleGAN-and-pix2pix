@@ -1,5 +1,5 @@
 
-<img src='imgs/imgs/cute_car.png' align="right" width=384>
+<img src='imgs/cute_car.png' align="right" width=384>
 
 <br><br><br>
 
