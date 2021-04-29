@@ -1,8 +1,36 @@
 
-<img src='imgs/horse2zebra.gif' align="right" width=384>
+<img src='imgs/imgs/cute_car.png' align="right" width=384>
 
 <br><br><br>
 
+# Augmented CycleGAN Fork
+Augmented CycleGAN is added in this branch. You can now produce 1-to-many images using Augmented CycleGAN.
+Please click compare changes to review the implementation.
+
+**Augmented CycleGAN implementation:**
+
+File added:
+- models/aug_cycle_gan_model.py (The main model implementation file)
+
+File Modified:
+- data/__init__.py
+- options/base_options.py
+- models/networks.py
+
+To run Augmented CycleGAN, simple change the model to be "aug_cycle_gan". i.e: `--model aug_cycle_gan`
+
+**Syn2Real Dataset Notebook:**
+
+- /scripts/CycleGAN_Download_Data.ipynb
+  - Used to download the Sync2Real dataset
+  - Filter and created test/train dataset/folders that suits this project (testA,testB,trainA,trainB)
+- /scripts/CycleGAN_Metrics_and_Plot.ipynb
+  - Loss plotting based on the loss_log.txt file
+  - Generated testing images display
+  - AlexNet classification of test image result 
+
+
+ 
 # CycleGAN and pix2pix in PyTorch
 
 **New**:  Please check out [contrastive-unpaired-translation](https://github.com/taesungp/contrastive-unpaired-translation) (CUT), our new unpaired image-to-image translation model that enables fast and memory-efficient training.
